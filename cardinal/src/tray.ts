@@ -3,7 +3,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { Menu, MenuItem, PredefinedMenuItem } from '@tauri-apps/api/menu';
 import { TrayIcon, type TrayIconOptions } from '@tauri-apps/api/tray';
 import i18n from './i18n/config';
-import { QUICK_LAUNCH_SHORTCUT } from './utils/globalShortcuts';
 
 const TRAY_ID = 'cardinal.tray';
 
@@ -46,7 +45,6 @@ async function createTray(): Promise<void> {
   const openItem = await MenuItem.new({
     id: 'tray.open',
     text: i18n.t('tray.open'),
-    accelerator: QUICK_LAUNCH_SHORTCUT,
     action: () => {
       void activateMainWindow();
     },

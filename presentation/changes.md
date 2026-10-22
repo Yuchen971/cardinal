@@ -4,6 +4,13 @@
 
 ## 2026-10-22
 
+### 去掉全局快捷键 ⌘⇧Space
+
+- 原来 ⌘⇧Space 在任何应用里都会被 Cardinal 抢走，用来显示或隐藏 Cardinal 窗口。现在不再注册这个快捷键，这个组合键还给其他应用。
+- 菜单栏图标菜单里的 "Open" 后面不再显示 ⌘⇧Space。
+- 打开窗口的方式：点菜单栏图标里的 "Open"，在 Tuna 里选 "Show all … results in Cardinal"，或者双击 Cardinal 应用。
+- 窗口内的快捷键（⌘F、⌘O、方向键、空格预览、Esc 等）不变，它们只在 Cardinal 窗口在最前面时生效。
+
 ### 其他应用可以用 Cardinal 搜文件
 
 为接下来的 Tuna 插件做准备：Tuna 这类启动器可以把关键词交给 Cardinal，拿回结果列表显示在自己的界面里。
