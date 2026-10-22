@@ -1,6 +1,8 @@
 mod background;
 mod commands;
+mod external_search;
 mod lifecycle;
+mod local_api;
 mod quicklook;
 mod search_activity;
 mod sort;
@@ -20,6 +22,7 @@ use commands::{
     toggle_quicklook, trigger_rescan, update_icon_viewport, update_quicklook,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
+use external_search::ExternalSearchJob;
 use lifecycle::{
     APP_QUIT, AppLifecycleState, EXIT_REQUESTED, emit_app_state, load_app_state, update_app_state,
 };
@@ -59,6 +62,7 @@ pub fn run() -> Result<()> {
 
     let (finish_tx, finish_rx) = bounded::<Sender<Option<SearchCache>>>(1);
     let (search_tx, search_rx) = unbounded::<SearchJob>();
+    let (external_search_tx, external_search_rx) = unbounded::<ExternalSearchJob>();
     let (node_info_tx, node_info_rx) = unbounded::<NodeInfoRequest>();
     let (icon_viewport_tx, icon_viewport_rx) = unbounded::<(u64, Vec<SlabIndex>)>();
     let (rescan_tx, rescan_rx) = unbounded::<CancellationToken>();
@@ -148,10 +152,25 @@ pub fn run() -> Result<()> {
         .get_or_try_init(|| app.path().app_config_dir().map(|p| p.join("cardinal.db")))
         .expect("Failed to initialize database path");
 
+    let local_api_file = app
+        .path()
+        .app_config_dir()
+        .map(|dir| dir.join(local_api::CONNECTION_FILE_NAME))
+        .ok();
+    match &local_api_file {
+        Some(path) => {
+            if let Err(err) = local_api::start(app.handle().clone(), external_search_tx, path) {
+                warn!(?err, "Local API is unavailable");
+            }
+        }
+        None => warn!("Local API is unavailable: no app config directory"),
+    }
+
     let app_handle = &app.handle().to_owned();
     let channels = BackgroundLoopChannels {
         finish_rx,
         search_rx,
+        external_search_rx,
         node_info_rx,
         icon_viewport_rx,
         rescan_rx,
@@ -186,6 +205,9 @@ pub fn run() -> Result<()> {
         app.run(move |app_handle, event| match event {
             RunEvent::Exit => {
                 APP_QUIT.store(true, Ordering::Relaxed);
+                if let Some(path) = &local_api_file {
+                    local_api::remove_connection_file(path);
+                }
                 flush_cache_to_file_once(&finish_tx, db_path);
             }
             RunEvent::ExitRequested { api, code, .. } => {

@@ -28,6 +28,7 @@ export type WindowDragDropEvent = TauriEvent<DragDropEvent>;
 const statusBarUpdateListeners = new Set<Listener<StatusBarUpdatePayload>>();
 const lifecycleStateListeners = new Set<Listener<AppLifecycleStatus>>();
 const quickLaunchListeners = new Set<Listener<void>>();
+const externalSearchListeners = new Set<Listener<string>>();
 const fsEventsBatchListeners = new Set<Listener<RecentEventPayload[]>>();
 const iconUpdateListeners = new Set<Listener<readonly IconUpdatePayload[]>>();
 const quickLookKeydownListeners = new Set<Listener<QuickLookKeydownPayload>>();
@@ -116,6 +117,12 @@ export const initializeTauriEventRuntime = (): Promise<void> => {
       }).catch((error) => {
         console.error('Failed to register quick_launch listener', error);
       }),
+      listen<string>('external_search', (event) => {
+        if (typeof event.payload !== 'string') return;
+        emit(externalSearchListeners, event.payload);
+      }).catch((error) => {
+        console.error('Failed to register external_search listener', error);
+      }),
       listen<RecentEventPayload[]>('fs_events_batch', (event) => {
         const payload = normalizeRecentEvents(event.payload);
         if (payload.length === 0) return;
@@ -167,6 +174,12 @@ export const subscribeLifecycleState = (listener: Listener<AppLifecycleStatus>):
 export const subscribeQuickLaunch = (listener: () => void): UnlistenFn => {
   void initializeTauriEventRuntime();
   return subscribe(quickLaunchListeners, listener);
+};
+
+/** Queries sent by other apps through the local API ("Show all results in Cardinal"). */
+export const subscribeExternalSearch = (listener: Listener<string>): UnlistenFn => {
+  void initializeTauriEventRuntime();
+  return subscribe(externalSearchListeners, listener);
 };
 
 export const subscribeFSEventsBatch = (listener: Listener<RecentEventPayload[]>): UnlistenFn => {

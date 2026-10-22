@@ -9,6 +9,10 @@ pub static ACTIVE_SEARCH_VERSION: AtomicU64 = AtomicU64::new(0);
 /// A global atomic identifies the active scanning process version of Cardinal.
 pub static ACTIVE_SCAN_VERSION: AtomicU64 = AtomicU64::new(0);
 
+/// A global atomic identifies the active search version requested by other apps
+/// through the local API, kept apart so they never cancel the window's searches.
+pub static ACTIVE_EXTERNAL_SEARCH_VERSION: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug)]
 pub struct CancellationToken {
     active_version: &'static AtomicU64,
@@ -41,6 +45,17 @@ impl CancellationToken {
         Self {
             version,
             active_version: &ACTIVE_SCAN_VERSION,
+        }
+    }
+
+    /// Creates a token for a search requested by another app.
+    ///
+    /// It only cancels older external searches, not searches from the window.
+    pub fn new_external_search() -> Self {
+        let version = self::ACTIVE_EXTERNAL_SEARCH_VERSION.fetch_add(1, Ordering::SeqCst) + 1;
+        Self {
+            version,
+            active_version: &ACTIVE_EXTERNAL_SEARCH_VERSION,
         }
     }
 

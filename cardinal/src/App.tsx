@@ -213,6 +213,7 @@ function App() {
     setLifecycleState,
     submitFilesQuery,
     setEventFilterQuery,
+    onTabChange,
   });
 
   const navigateSelection = useStableEvent(moveSelection);

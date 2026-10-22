@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { RefObject } from 'react';
 import type { StatusTabKey } from '../components/StatusBar';
 import {
+  subscribeExternalSearch,
   subscribeLifecycleState,
   subscribeQuickLaunch,
   subscribeStatusBarUpdate,
@@ -23,6 +24,7 @@ type UseAppWindowListenersOptions = {
   setLifecycleState: (status: AppLifecycleStatus) => void;
   submitFilesQuery: (query: string, options?: QueueSearchOptions) => void;
   setEventFilterQuery: (value: string) => void;
+  onTabChange: (tab: StatusTabKey) => void;
 };
 
 type UseAppWindowListenersResult = {
@@ -41,6 +43,7 @@ export function useAppWindowListeners({
   setLifecycleState,
   submitFilesQuery,
   setEventFilterQuery,
+  onTabChange,
 }: UseAppWindowListenersOptions): UseAppWindowListenersResult {
   const [isWindowFocused, setIsWindowFocused] = useState<boolean>(() => {
     if (typeof document === 'undefined') {
@@ -69,6 +72,20 @@ export function useAppWindowListeners({
     });
     return unlistenQuickLaunch;
   }, [focusAndSelectSearchInput]);
+
+  // Another app asked to show its query here, so run it in the files tab.
+  const handleExternalSearch = useStableEvent((query: string) => {
+    if (activeTab !== 'files') {
+      onTabChange('files');
+    }
+    submitFilesQuery(query, { immediate: true });
+    focusAndSelectSearchInput();
+  });
+
+  useEffect(() => {
+    const unlistenExternalSearch = subscribeExternalSearch(handleExternalSearch);
+    return unlistenExternalSearch;
+  }, [handleExternalSearch]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {

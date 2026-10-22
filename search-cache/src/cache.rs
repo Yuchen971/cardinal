@@ -545,6 +545,16 @@ impl SearchCache {
         self.file_nodes.node_path(index)
     }
 
+    /// Get the file name of the node in the slab without building its full path.
+    pub fn node_name(&self, index: SlabIndex) -> Option<&'static str> {
+        self.file_nodes.get(index).map(|node| node.name())
+    }
+
+    /// Get the parent of the node in the slab. The root node has no parent.
+    pub fn node_parent(&self, index: SlabIndex) -> Option<SlabIndex> {
+        self.file_nodes.get(index)?.parent()
+    }
+
     /// Locate the slab index for an absolute path when it belongs to the watch root.
     pub fn node_index_for_path(&self, path: &Path) -> Option<SlabIndex> {
         self.node_index_for_path_with_case(path, false)

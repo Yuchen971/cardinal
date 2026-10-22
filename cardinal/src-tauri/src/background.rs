@@ -1,5 +1,6 @@
 use crate::{
     commands::{NodeInfoRequest, SearchJob, WatchConfigUpdate},
+    external_search::{ExternalSearchJob, handle_external_search},
     lifecycle::{APP_QUIT, AppLifecycleState, load_app_state, update_app_state},
     search_activity,
     window_controls::is_main_window_foreground,
@@ -18,7 +19,7 @@ use search_cancel::CancellationToken;
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter};
@@ -43,6 +44,7 @@ pub struct BackgroundLoopChannels {
     pub finish_rx: Receiver<Sender<Option<SearchCache>>>,
     pub update_window_state_rx: Receiver<()>,
     pub search_rx: Receiver<SearchJob>,
+    pub external_search_rx: Receiver<ExternalSearchJob>,
     pub node_info_rx: Receiver<NodeInfoRequest>,
     pub icon_viewport_rx: Receiver<(u64, Vec<SlabIndex>)>,
     pub rescan_rx: Receiver<CancellationToken>,
@@ -63,6 +65,13 @@ pub fn reset_status_bar(app_handle: &AppHandle) {
         .unwrap();
 }
 
+/// Latest file count shown in the status bar, also reported by the local API.
+static INDEXED_FILES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn indexed_files() -> usize {
+    INDEXED_FILES.load(Ordering::Relaxed)
+}
+
 pub fn emit_status_bar_update(
     app_handle: &AppHandle,
     scanned_files: usize,
@@ -72,6 +81,7 @@ pub fn emit_status_bar_update(
     static LAST_EMIT: Lazy<Mutex<Instant>> =
         Lazy::new(|| Mutex::new(Instant::now() - Duration::from_secs(1)));
 
+    INDEXED_FILES.store(scanned_files, Ordering::Relaxed);
     {
         let mut last_emit = LAST_EMIT.lock();
         if Instant::now().duration_since(*last_emit) < Duration::from_millis(100) {
@@ -314,6 +324,7 @@ pub fn run_background_event_loop(
         finish_rx,
         update_window_state_rx,
         search_rx,
+        external_search_rx,
         node_info_rx,
         icon_viewport_rx,
         rescan_rx,
@@ -364,6 +375,10 @@ pub fn run_background_event_loop(
                 let opts = SearchOptions::from(options);
                 let payload = cache.search_query_with_options(query, opts, cancellation_token);
                 result_tx.send(payload).expect("Failed to send result");
+            }
+            recv(external_search_rx) -> job => {
+                let job = job.expect("External search channel closed");
+                handle_external_search(&mut cache, job);
             }
             recv(node_info_rx) -> request => {
                 let request = request.expect("Node info channel closed");

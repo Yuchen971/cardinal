@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { RefObject } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  subscribeExternalSearch,
   subscribeLifecycleState,
   subscribeQuickLaunch,
   subscribeStatusBarUpdate,
@@ -13,12 +14,14 @@ vi.mock('../../runtime/tauriEventRuntime', () => ({
   subscribeStatusBarUpdate: vi.fn(),
   subscribeLifecycleState: vi.fn(),
   subscribeQuickLaunch: vi.fn(),
+  subscribeExternalSearch: vi.fn(),
   subscribeWindowDragDrop: vi.fn(),
 }));
 
 const mockedSubscribeStatusBarUpdate = vi.mocked(subscribeStatusBarUpdate);
 const mockedSubscribeLifecycleState = vi.mocked(subscribeLifecycleState);
 const mockedSubscribeQuickLaunch = vi.mocked(subscribeQuickLaunch);
+const mockedSubscribeExternalSearch = vi.mocked(subscribeExternalSearch);
 const mockedSubscribeWindowDragDrop = vi.mocked(subscribeWindowDragDrop);
 
 type HookProps = {
@@ -29,12 +32,14 @@ type HookProps = {
   setLifecycleState: (status: 'Initializing' | 'Updating' | 'Ready') => void;
   submitFilesQuery: (query: string, options?: { immediate?: boolean }) => void;
   setEventFilterQuery: (query: string) => void;
+  onTabChange: (tab: 'files' | 'events') => void;
 };
 
 describe('useAppWindowListeners', () => {
   const statusUnlisten = vi.fn();
   const lifecycleUnlisten = vi.fn();
   const quickLaunchUnlisten = vi.fn();
+  const externalSearchUnlisten = vi.fn();
   const dragDropUnlisten = vi.fn();
 
   const focusAndSelectSearchInput = vi.fn();
@@ -42,6 +47,7 @@ describe('useAppWindowListeners', () => {
   const setLifecycleState = vi.fn();
   const submitFilesQuery = vi.fn();
   const setEventFilterQuery = vi.fn();
+  const onTabChange = vi.fn();
   const searchInputRef: { current: HTMLInputElement | null } = { current: null };
   let searchInputElement: HTMLInputElement;
   let elementFromPointMock: ReturnType<typeof vi.fn>;
@@ -51,6 +57,7 @@ describe('useAppWindowListeners', () => {
     | null;
   let lifecycleCallback: ((status: 'Initializing' | 'Updating' | 'Ready') => void) | null;
   let quickLaunchCallback: (() => void) | null;
+  let externalSearchCallback: ((query: string) => void) | null;
   let dragDropCallback: ((event: any) => void) | null;
 
   const renderWindowListeners = (overrides: Partial<HookProps> = {}) =>
@@ -63,6 +70,7 @@ describe('useAppWindowListeners', () => {
         setLifecycleState,
         submitFilesQuery,
         setEventFilterQuery,
+        onTabChange,
         ...overrides,
       },
     });
@@ -72,6 +80,7 @@ describe('useAppWindowListeners', () => {
     statusCallback = null;
     lifecycleCallback = null;
     quickLaunchCallback = null;
+    externalSearchCallback = null;
     dragDropCallback = null;
     document.documentElement.removeAttribute('data-window-focused');
     searchInputElement = document.createElement('input');
@@ -93,6 +102,10 @@ describe('useAppWindowListeners', () => {
     mockedSubscribeQuickLaunch.mockImplementation((listener) => {
       quickLaunchCallback = listener;
       return quickLaunchUnlisten;
+    });
+    mockedSubscribeExternalSearch.mockImplementation((listener) => {
+      externalSearchCallback = listener;
+      return externalSearchUnlisten;
     });
     mockedSubscribeWindowDragDrop.mockImplementation((listener) => {
       dragDropCallback = listener;
@@ -151,6 +164,7 @@ describe('useAppWindowListeners', () => {
       setLifecycleState,
       submitFilesQuery,
       setEventFilterQuery,
+      onTabChange,
     });
 
     act(() => {
@@ -159,6 +173,38 @@ describe('useAppWindowListeners', () => {
       });
     });
     expect(setEventFilterQuery).toHaveBeenCalledWith('"/tmp/file-b"');
+  });
+
+  it('runs queries from other apps in the files tab', async () => {
+    const { rerender } = renderWindowListeners();
+
+    await waitFor(() => {
+      expect(externalSearchCallback).not.toBeNull();
+    });
+
+    act(() => {
+      externalSearchCallback?.('ext:pdf report');
+    });
+    expect(onTabChange).not.toHaveBeenCalled();
+    expect(submitFilesQuery).toHaveBeenCalledWith('ext:pdf report', { immediate: true });
+    expect(focusAndSelectSearchInput).toHaveBeenCalledTimes(1);
+
+    rerender({
+      activeTab: 'events',
+      searchInputRef,
+      focusAndSelectSearchInput,
+      handleStatusUpdate,
+      setLifecycleState,
+      submitFilesQuery,
+      setEventFilterQuery,
+      onTabChange,
+    });
+
+    act(() => {
+      externalSearchCallback?.('notes');
+    });
+    expect(onTabChange).toHaveBeenCalledWith('files');
+    expect(submitFilesQuery).toHaveBeenLastCalledWith('notes', { immediate: true });
   });
 
   it('ignores drops outside the search input', async () => {
@@ -202,6 +248,7 @@ describe('useAppWindowListeners', () => {
     expect(statusUnlisten).toHaveBeenCalledTimes(1);
     expect(lifecycleUnlisten).toHaveBeenCalledTimes(1);
     expect(quickLaunchUnlisten).toHaveBeenCalledTimes(1);
+    expect(externalSearchUnlisten).toHaveBeenCalledTimes(1);
     expect(dragDropUnlisten).toHaveBeenCalledTimes(1);
   });
 });
