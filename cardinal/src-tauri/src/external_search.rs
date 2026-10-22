@@ -2,8 +2,10 @@
 //!
 //! The window shows every match and lets the user sort them, but a launcher only
 //! shows the first few dozen. So external results are ranked for that case:
-//! 1. noise (system files, app internals, caches, dependencies, build output and
-//!    hidden files) always comes last, however well its name matches,
+//! 1. noise comes last, however well its name matches. Noise the user may have
+//!    edited (dotfiles, ~/Library, system settings) is exempt when it changed in the
+//!    last 7 days; generated noise (dependencies, build output, caches, app
+//!    internals, the OS itself) never is,
 //! 2. then by how well the file name matches (exact, then prefix, then contains),
 //! 3. then by where the file lives (home folder before the rest of the disk),
 //! 4. then by modification time (newest first).
@@ -16,19 +18,27 @@ use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// How many of the best candidates get their metadata loaded for the final ordering.
 const CANDIDATE_POOL: usize = 2000;
 
-/// Top-level folders that only hold system files.
-const SYSTEM_ROOT_DIRS: &[&str] = &[
-    "System", "Library", "usr", "bin", "sbin", "private", "opt", "cores", "dev", "etc", "var",
-    "tmp",
-];
+/// Extra candidates from noise the user may have edited, so a recently edited one can
+/// still make the list when plenty of ordinary files match.
+const EDITABLE_NOISE_POOL: usize = 500;
+
+/// Editable noise changed within this many seconds ranks like an ordinary file.
+const RECENT_EDIT_WINDOW_SECS: u32 = 7 * 24 * 60 * 60;
+
+/// Top-level folders that hold the operating system itself.
+const OS_ROOT_DIRS: &[&str] = &["System", "usr", "bin", "sbin", "cores", "dev"];
+
+/// Top-level folders that hold system-wide settings and data the user may edit.
+const SYSTEM_DATA_ROOT_DIRS: &[&str] = &["Library", "private", "opt", "etc", "var", "tmp"];
 
 /// Folders whose contents are cached, downloaded or built rather than made by the user.
-const NOISY_DIR_NAMES: &[&str] = &[
+const GENERATED_DIR_NAMES: &[&str] = &[
     "node_modules",
     "__pycache__",
     "DerivedData",
@@ -36,7 +46,32 @@ const NOISY_DIR_NAMES: &[&str] = &[
     "target",
     "build",
     "dist",
+    ".git",
+    ".cache",
+    ".npm",
+    ".cargo",
+    ".rustup",
+    ".nvm",
+    ".pnpm-store",
+    ".gradle",
+    ".m2",
+    ".venv",
+    ".build",
+    ".swiftpm",
+    ".next",
+    ".turbo",
+    ".vercel",
+    ".expo",
+    ".parcel-cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".terraform",
 ];
+
+/// Hidden files that macOS writes on its own, often several times a day.
+const GENERATED_HIDDEN_FILES: &[&str] = &[".DS_Store", ".localized", ".CFUserTextEncoding"];
 
 /// Package folders. The package itself is a useful result, its contents are not.
 const PACKAGE_SUFFIXES: &[&str] = &[
@@ -129,25 +164,31 @@ pub(crate) fn run_external_search(
         candidates.push((CandidateKey { name_rank, place }, index));
     }
 
-    // Loading metadata touches the disk, so only do it for the best candidates.
-    if candidates.len() > CANDIDATE_POOL {
-        candidates.select_nth_unstable_by_key(CANDIDATE_POOL - 1, |(key, _)| key.pool_order());
-        candidates.truncate(CANDIDATE_POOL);
-    }
+    // Loading metadata touches the disk, so only do it for the best candidates. Editable
+    // noise gets its own share: its modification time decides whether it sinks.
+    let (mut editable_noise, mut candidates): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|(key, _)| key.place.is_editable_noise());
+    keep_best(&mut candidates, CANDIDATE_POOL, |key| key.pool_order());
+    keep_best(&mut editable_noise, EDITABLE_NOISE_POOL, |key| {
+        (key.name_rank, key.place.depth)
+    });
+    candidates.append(&mut editable_noise);
     let indices: Vec<SlabIndex> = candidates.iter().map(|(_, index)| *index).collect();
     let nodes = cache.expand_file_nodes(&indices);
 
-    let mut ranked: Vec<(CandidateKey, SearchResultNode)> = candidates
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX))
+        .unwrap_or_default();
+    let mut ranked: Vec<(RankKey, SearchResultNode)> = candidates
         .into_iter()
-        .map(|(key, _)| key)
         .zip(nodes)
+        .map(|((key, _), node)| (key.final_rank(modified_at(&node), now), node))
         .collect();
     ranked.sort_by(|(a_key, a_node), (b_key, b_node)| {
         a_key
-            .is_noise()
-            .cmp(&b_key.is_noise())
-            .then_with(|| a_key.name_rank.cmp(&b_key.name_rank))
-            .then_with(|| a_key.place.tier.cmp(&b_key.place.tier))
+            .cmp(b_key)
             .then_with(|| modified_at(b_node).cmp(&modified_at(a_node)))
             .then_with(|| a_node.path.cmp(&b_node.path))
     });
@@ -157,6 +198,18 @@ pub(crate) fn run_external_search(
         total,
         nodes: ranked.into_iter().map(|(_, node)| node).collect(),
     }))
+}
+
+/// Keeps the `count` candidates with the smallest `order`, in no particular order.
+fn keep_best<K: Ord>(
+    candidates: &mut Vec<(CandidateKey, SlabIndex)>,
+    count: usize,
+    order: impl Fn(&CandidateKey) -> K,
+) {
+    if candidates.len() > count {
+        candidates.select_nth_unstable_by_key(count - 1, |(key, _)| order(key));
+        candidates.truncate(count);
+    }
 }
 
 fn modified_at(node: &SearchResultNode) -> u32 {
@@ -173,16 +226,23 @@ struct CandidateKey {
     place: Place,
 }
 
+/// Final order before modification time: noise last, then name match, then place.
+/// Within noise, what the user may have edited comes before what programs generate.
+type RankKey = (bool, NameRank, PlaceTier, Option<NoiseKind>);
+
 impl CandidateKey {
-    fn is_noise(&self) -> bool {
-        self.place.tier == PlaceTier::Noise
+    fn final_rank(&self, modified: u32, now: u32) -> RankKey {
+        let tier = self.place.tier_given_edit(modified, now);
+        let is_noise = tier == PlaceTier::Noise;
+        let noise = if is_noise { self.place.noise } else { None };
+        (is_noise, self.name_rank, tier, noise)
     }
 
     /// Order used to pick the candidate pool, before modification times are known.
     /// Shallower files win ties, since they are more likely to be what the user meant.
     fn pool_order(&self) -> (bool, NameRank, PlaceTier, u16) {
         (
-            self.is_noise(),
+            self.place.tier == PlaceTier::Noise,
             self.name_rank,
             self.place.tier,
             self.place.depth,
@@ -269,6 +329,11 @@ impl NameQuery {
     }
 
     pub(crate) fn rank(&self, name: &str) -> NameRank {
+        // People type "zshrc" for ".zshrc", so a leading dot does not count.
+        let name = match name.strip_prefix('.') {
+            Some(rest) if !rest.is_empty() => rest,
+            _ => name,
+        };
         // The phrase starts with the first word, so an exact match is always a prefix
         // match too. Checking the prefix first lets most names stop here.
         if !self.starts_with(name, &self.first) {
@@ -317,21 +382,51 @@ pub(crate) enum PlaceTier {
     /// Elsewhere on disk, such as apps in /Applications or external volumes.
     Elsewhere,
     /// System files, app internals, caches, dependencies, build output and hidden files.
-    /// Always ranked last, whatever the name match.
+    /// Ranked last, whatever the name match.
     Noise,
+}
+
+/// Why a file counts as noise. Ordered so the stronger reason wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NoiseKind {
+    /// Dotfiles, ~/Library and system settings: the user may have edited these.
+    Editable,
+    /// Dependencies, build output, caches, app internals and the OS itself.
+    Generated,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Place {
     pub(crate) tier: PlaceTier,
+    in_home: bool,
+    noise: Option<NoiseKind>,
     depth: u16,
+}
+
+impl Place {
+    fn is_editable_noise(&self) -> bool {
+        self.noise == Some(NoiseKind::Editable)
+    }
+
+    /// Editable noise changed recently ranks like an ordinary file in the same place.
+    fn tier_given_edit(&self, modified: u32, now: u32) -> PlaceTier {
+        if self.is_editable_noise() && modified.saturating_add(RECENT_EDIT_WINDOW_SECS) >= now {
+            if self.in_home {
+                PlaceTier::Home
+            } else {
+                PlaceTier::Elsewhere
+            }
+        } else {
+            self.tier
+        }
+    }
 }
 
 /// What a folder means for the files inside it.
 #[derive(Debug, Clone, Copy)]
 struct FolderContext {
     in_home: bool,
-    noisy: bool,
+    noise: Option<NoiseKind>,
     depth: u16,
 }
 
@@ -377,6 +472,8 @@ impl PlaceClassifier {
         let Some(parent) = cache.node_parent(index) else {
             return Place {
                 tier: PlaceTier::Elsewhere,
+                in_home: false,
+                noise: None,
                 depth: 0,
             };
         };
@@ -388,7 +485,8 @@ impl PlaceClassifier {
                 context
             }
         };
-        let tier = if context.noisy || name.starts_with('.') {
+        let noise = context.noise.max(file_noise(name));
+        let tier = if noise.is_some() {
             PlaceTier::Noise
         } else if context.in_home {
             PlaceTier::Home
@@ -397,6 +495,8 @@ impl PlaceClassifier {
         };
         Place {
             tier,
+            in_home: context.in_home,
+            noise,
             depth: context.depth,
         }
     }
@@ -424,7 +524,7 @@ impl PlaceClassifier {
             let next = match context {
                 None => FolderContext {
                     in_home: Some(folder) == self.home,
-                    noisy: false,
+                    noise: None,
                     depth: 0,
                 },
                 Some(parent_context) => {
@@ -434,8 +534,11 @@ impl PlaceClassifier {
                     let parent_is_home = parent.is_some() && parent == self.home;
                     FolderContext {
                         in_home: parent_context.in_home || Some(folder) == self.home,
-                        noisy: parent_context.noisy
-                            || hides_contents(name, parent_is_root, parent_is_home),
+                        noise: parent_context.noise.max(folder_noise(
+                            name,
+                            parent_is_root,
+                            parent_is_home,
+                        )),
                         depth: parent_context.depth.saturating_add(1),
                     }
                 }
@@ -447,13 +550,37 @@ impl PlaceClassifier {
     }
 }
 
-/// Whether files inside this folder are system files, app internals or generated noise.
-pub(crate) fn hides_contents(name: &str, parent_is_root: bool, parent_is_home: bool) -> bool {
-    name.starts_with('.')
-        || (parent_is_root && SYSTEM_ROOT_DIRS.contains(&name))
-        || (parent_is_home && name == "Library")
-        || NOISY_DIR_NAMES.contains(&name)
+/// Whether a file is noise on its own, whatever folder it is in.
+pub(crate) fn file_noise(name: &str) -> Option<NoiseKind> {
+    if GENERATED_HIDDEN_FILES.contains(&name) || name.starts_with("._") {
+        // `._name` files hold Finder metadata copied to non-Mac disks.
+        Some(NoiseKind::Generated)
+    } else if name.starts_with('.') {
+        Some(NoiseKind::Editable)
+    } else {
+        None
+    }
+}
+
+/// Whether files inside this folder are noise, and why.
+pub(crate) fn folder_noise(
+    name: &str,
+    parent_is_root: bool,
+    parent_is_home: bool,
+) -> Option<NoiseKind> {
+    if GENERATED_DIR_NAMES.contains(&name)
         || PACKAGE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        || (parent_is_root && OS_ROOT_DIRS.contains(&name))
+    {
+        Some(NoiseKind::Generated)
+    } else if name.starts_with('.')
+        || (parent_is_root && SYSTEM_DATA_ROOT_DIRS.contains(&name))
+        || (parent_is_home && name == "Library")
+    {
+        Some(NoiseKind::Editable)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -511,20 +638,85 @@ mod tests {
         assert_eq!(chinese.rank("报告2024.pdf"), NameRank::Prefix);
         assert_eq!(chinese.rank("年度报告.pdf"), NameRank::Contains);
 
+        // A leading dot does not count: "zshrc" finds ".zshrc".
+        let dotfile = NameQuery::new("zshrc", true).unwrap();
+        assert_eq!(dotfile.rank(".zshrc"), NameRank::Exact);
+        assert_eq!(dotfile.rank(".zshrc.bak"), NameRank::Exact);
+        assert_eq!(dotfile.rank("zshrc_Apple_Terminal"), NameRank::Prefix);
+
         assert!(NameQuery::new("ext:pdf size:>1MB", true).is_none());
     }
 
     #[test]
-    fn hides_contents_of_system_and_generated_folders() {
-        assert!(hides_contents("System", true, false));
-        assert!(!hides_contents("System", false, false));
-        assert!(hides_contents("Library", false, true));
-        assert!(!hides_contents("Library", false, false));
-        assert!(hides_contents(".git", false, false));
-        assert!(hides_contents("node_modules", false, false));
-        assert!(hides_contents("target", false, false));
-        assert!(hides_contents("Safari.app", false, false));
-        assert!(!hides_contents("Documents", false, true));
+    fn folder_noise_tells_editable_from_generated() {
+        use NoiseKind::{Editable, Generated};
+        assert_eq!(folder_noise("System", true, false), Some(Generated));
+        assert_eq!(folder_noise("System", false, false), None);
+        assert_eq!(folder_noise("Library", true, false), Some(Editable));
+        assert_eq!(folder_noise("Library", false, true), Some(Editable));
+        assert_eq!(folder_noise("Library", false, false), None);
+        assert_eq!(folder_noise(".config", false, true), Some(Editable));
+        assert_eq!(folder_noise(".git", false, false), Some(Generated));
+        assert_eq!(folder_noise("node_modules", false, false), Some(Generated));
+        assert_eq!(folder_noise("target", false, false), Some(Generated));
+        assert_eq!(folder_noise("Safari.app", false, false), Some(Generated));
+        assert_eq!(folder_noise("Documents", false, true), None);
+        assert_eq!(folder_noise(".build", false, false), Some(Generated));
+
+        assert_eq!(file_noise(".zshrc"), Some(Editable));
+        assert_eq!(file_noise(".DS_Store"), Some(Generated));
+        assert_eq!(file_noise("._report.pdf"), Some(Generated));
+        assert_eq!(file_noise("report.pdf"), None);
+    }
+
+    #[test]
+    fn recently_edited_noise_ranks_like_an_ordinary_file() {
+        let (_temp, root) = temp_root();
+        let now = SystemTime::now();
+        let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        touch_at(&root, "home/Documents/report.pdf", long_ago);
+        touch_at(&root, "home/Documents/report-draft.pdf", long_ago);
+        // Editable noise: rises when changed in the last 7 days, sinks otherwise.
+        touch_at(&root, "home/.config/report.toml", now);
+        touch_at(
+            &root,
+            "home/Library/Application Support/App/report.json",
+            long_ago,
+        );
+        // Generated noise: sinks however recent.
+        touch_at(&root, "home/project/target/release/report", now);
+        touch_at(&root, "home/.config/app/node_modules/report.js", now);
+
+        let mut cache = SearchCache::walk_fs(&root);
+        let results = run_external_search(
+            &mut cache,
+            "report",
+            true,
+            50,
+            Some(&root.join("home")),
+            CancellationToken::noop(),
+        )
+        .unwrap()
+        .unwrap();
+        let order: Vec<_> = results
+            .nodes
+            .iter()
+            .map(|node| node.path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                // Exact matches in home, newest first: the recently edited dotfile leads.
+                "home/.config/report.toml",
+                "home/Documents/report.pdf",
+                "home/Documents/report-draft.pdf",
+                // Noise: editable before generated, then newest first, then by path.
+                "home/Library/Application Support/App/report.json",
+                "home/.config/app/node_modules/report.js",
+                "home/project/target/release/report",
+            ]
+            .map(std::path::PathBuf::from)
+        );
     }
 
     /// Creates a file with a fixed modification time so ties fall back to path order.
@@ -596,9 +788,10 @@ mod tests {
                 "home/Documents/report-draft.pdf",
                 // Contains matches.
                 "home/Notes/old report.txt",
-                // Noise last, even when the name is an exact match.
-                "Tools.app/Contents/report.pdf",
+                // Noise last, even when the name is an exact match. What the user may
+                // have edited comes before what programs generate.
                 "home/.config/report.toml",
+                "Tools.app/Contents/report.pdf",
                 "home/Library/Caches/report.pdf",
                 "home/project/node_modules/pkg/report.js",
                 "home/project/target/release/report",
